@@ -1,47 +1,49 @@
 # src/bale_bot/converter.py
-import openpyxl
+import pandas as pd
+import vobject
 from io import BytesIO
+import zipfile
 
-def generate_vcard_string(contacts):
+def convert_excel_to_vcf(file_content: bytes) -> bytes:
     """
-    یک لیست از دیکشنری‌های مخاطبین را به یک رشته vCard تبدیل می‌کند.
+    دریافت بایت‌های XLSX و بازگشت بایت‌های ZIP شامل یک VCF برای هر گروه Cat.
     """
-    vcard_entries =[]
-    for contact in contacts:
-        name = contact.get('name', '')
-        phone = contact.get('phone', '')
-        if not name or not phone:
-            continue
-        
-        entry =[]
-        vcard_entries.append("\n".join(entry))
-    
-    return "\n".join(vcard_entries)
-
-def convert_excel_to_vcf(file_content: bytes):
-    """
-    محتوای باینری یک فایل اکسل را دریافت کرده و یک رشته vCard برمی‌گرداند.
-    """
-    contacts =[]
     try:
-        # فایل اکسل را از محتوای باینری در حافظه باز می‌کند
-        workbook = openpyxl.load_workbook(filename=BytesIO(file_content))
-        sheet = workbook.active
-        
-        # از ردیف دوم شروع به خواندن می‌کند تا از هدر صرف‌نظر شود (اختیاری)
-        for row in sheet.iter_rows(min_row=1, values_only=True):
-            if row and len(row) >= 2:
-                name = str(row).strip() if row else ''
-                phone = str(row).strip() if row else ''
-                
-                if name and phone:
-                    contacts.append({'name': name, 'phone': phone})
-
+        df = pd.read_excel(BytesIO(file_content))
     except Exception as e:
-        # در صورت بروز خطا در خواندن فایل، یک استثنا با پیام مناسب ایجاد می‌کند
-        raise ValueError(f"خطا در پردازش فایل اکسل: {e}")
+        raise ValueError(f"خطا در خواندن فایل Excel: {e}")
 
-    if not contacts:
-        raise ValueError("هیچ مخاطب معتبری در فایل اکسل یافت نشد.")
+    if 'Cat' not in df.columns:
+        raise ValueError("فایل ورودی باید ستون 'Cat' را داشته باشد.")
+    if 'Names' not in df.columns or 'Phone' not in df.columns:
+        raise ValueError("فایل باید ستون‌های 'Names' و 'Phone' را نیز داشته باشد.")
 
-    return generate_vcard_string(contacts)
+    output_io = BytesIO()
+    with zipfile.ZipFile(output_io, 'w', zipfile.ZIP_DEFLATED) as zf:
+        groups = df.groupby('Cat')
+        for group_name, group_df in groups:
+            vcf_entries = []
+            for _, row in group_df.iterrows():
+                try:
+                    vcard = vobject.vCard()
+                    vcard.add('fn').value = str(row['Names'])
+                    tel = vcard.add('tel')
+                    tel.value = '0' + str(row['Phone'])
+                    tel.type_param = 'CELL'
+                    vcf_entries.append(vcard.serialize())
+                except Exception:
+                    # رد کردن ردیف‌هایی با داده نامعتبر
+                    continue
+
+            if not vcf_entries:
+                continue
+
+            vcf_content = "\n".join(vcf_entries)
+            filename = f"contacts_{group_name}.vcf"
+            zf.writestr(filename, vcf_content.encode('utf-8'))
+
+    output_io.seek(0)
+    zip_bytes = output_io.read()
+    if not zip_bytes:
+        raise ValueError("هیچ مخاطب معتبری یافت نشد.")
+    return zip_bytes

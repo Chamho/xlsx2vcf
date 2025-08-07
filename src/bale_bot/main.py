@@ -1,111 +1,168 @@
-# src/bale_bot/main.py
-import asyncio
+import io
+import os
+import tempfile
 import logging
+from pathlib import Path
+from typing import Optional
+
 from balethon import Client
 from balethon.objects import Message, Document
-from balethon.conditions import private, command, document
 
-from. import config
-from. import converter
+from . import config, converter
 
-# تنظیمات لاگ‌گیری برای نمایش بهتر اطلاعات
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# نمونه‌سازی کلاینت ربات با توکن
 bot = Client(config.get_bot_token())
 ADMIN_ID = config.get_admin_id()
 
+# ---------------------------------------------------------------------------
+# Compatibility helpers
+# ---------------------------------------------------------------------------
 
-#... (ادامه main.py)
+def is_private_chat(chat) -> bool:
+    """True اگر چت خصوصی باشد (سازگار با نسخه‌های مختلف Balethon)."""
+    chat_type = getattr(chat, "type", chat)
+    if hasattr(chat_type, "is_private_chat"):
+        try:
+            return chat_type.is_private_chat()
+        except Exception:
+            pass
+    return str(chat_type).lower() in {"private", "pv"}
+
+
+def document_filename(doc: Document) -> Optional[str]:
+    """نام فایل ارسالی را برمی‌گرداند (camelCase / snake_case)."""
+    for attr in ("file_name", "filename", "name", "fileName"):
+        name = getattr(doc, attr, None)
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def document_mimetype(doc: Document) -> str:
+    for attr in ("mime_type", "mimeType", "mime"):
+        mt = getattr(doc, attr, "")
+        if mt:
+            return str(mt)
+    return ""
+
+
+def is_excel(doc: Document) -> bool:
+    filename = document_filename(doc)
+    if filename and filename.lower().endswith(".xlsx"):
+        return True
+    mimetype = document_mimetype(doc)
+    return mimetype in {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    }
+
+
+async def get_doc_bytes(doc: Document) -> bytes:
+    """دانلود بایت‌های فایل صرف نظر از نسخهٔ SDK."""
+    if hasattr(doc, "client") and hasattr(doc.client, "download") and callable(doc.client.download):
+        return await doc.client.download(doc.id)
+    if hasattr(doc, "download") and callable(doc.download):
+        return await doc.download()
+    if hasattr(doc, "read") and callable(doc.read):
+        return await doc.read()
+    if hasattr(doc, "save_to_memory") and callable(doc.save_to_memory):
+        buf = io.BytesIO()
+        await doc.save_to_memory(buf)
+        return buf.getvalue()
+    raise AttributeError("Document object exposes no known download method")
+
+# ---------------------------------------------------------------------------
+# Event handlers
+# ---------------------------------------------------------------------------
 
 @bot.on_connect()
 async def ready(client: Client):
-    """
-    این تابع هنگام اتصال موفقیت‌آمیز ربات به سرور بله اجرا می‌شود.
-    """
-    logger.info(f"Bot is connected as @{client.info.username}")
+    logger.info("Bot connected as @%s", client.info.username)
     if ADMIN_ID:
         await client.send_message(ADMIN_ID, "✅ ربات با موفقیت آنلاین شد.")
 
-@bot.on_message(private & command("start"))
-async def start_handler(message: Message):
-    """
-    پاسخ به دستور /start
-    """
-    welcome_text = (
-        "🤖 سلام! به ربات مبدل اکسل به VCF خوش آمدید.\n\n"
-        "کافیست یک فایل اکسل (.xlsx) برای من ارسال کنید.\n"
-        "فایل شما باید حداقل دو ستون داشته باشد:\n"
-        "ستون اول: نام مخاطب\n"
-        "ستون دوم: شماره تلفن\n\n"
-        "من فایل را پردازش کرده و یک فایل VCF برای ذخیره در مخاطبین گوشی به شما تحویل می‌دهم."
-    )
-    await message.reply(welcome_text)
 
-@bot.on_message(private & command("help"))
-async def help_handler(message: Message):
-    """
-    پاسخ به دستور /help
-    """
-    help_text = (
-        "راهنما:\n"
-        "1. یک فایل اکسل با فرمت `.xlsx` آماده کنید.\n"
-        "2. در ستون اول نام‌ها و در ستون دوم شماره تلفن‌ها را وارد کنید.\n"
-        "3. فایل را در همین چت برای من ارسال کنید.\n"
-        "4. منتظر بمانید تا فایل VCF را برایتان ارسال کنم.\n\n"
-        "⚠️ توجه: فرمت‌های دیگر اکسل (مانند.xls) یا فایل‌های دیگر پشتیبانی نمی‌شوند."
-    )
-    await message.reply(help_text)
-
-
-    #... (ادامه main.py)
-
-@bot.on_message(private & document)
-async def file_handler(message: Message):
-    """
-    پردازش فایل ارسال شده توسط کاربر
-    """
-    doc: Document = message.document
-    
-    # 1. اعتبارسنجی نوع فایل
-    if not doc.file_name.endswith((".xlsx")):
-        await message.reply("❌ خطا: لطفاً فقط فایل اکسل با فرمت `.xlsx` ارسال کنید.")
+@bot.on_message()
+async def handle_message(message: Message):
+    if not is_private_chat(message.chat):
+        logger.debug("Ignored non-PV message (chat type=%s)", getattr(message.chat, "type", "?"))
         return
 
-    # 2. اطلاع‌رسانی به کاربر
-    processing_msg = await message.reply("در حال پردازش فایل شما... لطفاً منتظر بمانید ⏳")
+    if message.text == "/start":
+        await start_handler(message)
+    elif message.text == "/help":
+        await help_handler(message)
+    elif message.document:
+        await file_handler(message)
+    elif message.text:
+        await message.reply("❌ لطفاً فقط فایل اکسل `.xlsx` یا دستور /help را ارسال کنید.")
 
+
+async def start_handler(message: Message):
+    await message.reply(
+        "🤖 سلام! به ربات مبدل اکسل به VCF خوش آمدید.\n\n"
+        "کافیست یک فایل اکسل (`.xlsx`) برای من ارسال کنید.\n"
+        "ستون‌های مورد نیاز: Names, Phone, Cat\n"
+        "برای هر مقدار متفاوت در Cat یک فایل VCF تولید می‌شود و در یک ZIP تحویل می‌گیرید."
+    )
+
+
+async def help_handler(message: Message):
+    await message.reply(
+        "راهنما:\n"
+        "• فایل اکسل با ستون‌های Names, Phone, Cat ارسال کنید.\n"
+        "• فقط فرمت .xlsx پشتیبانی می‌شود."
+    )
+
+
+async def file_handler(message: Message):
+    doc: Document = message.document
+
+    if not is_excel(doc):
+        await message.reply("❌ فایل ارسالی اکسل نیست. لطفاً .xlsx بفرستید.")
+        return
+
+    processing = await message.reply("⏳ در حال پردازش …")
+
+    tmp_path = None
     try:
-        # 3. دانلود محتوای فایل در حافظه
-        file_content: bytes = await doc.download()
+        # دریافت بایت‌های اکسل
+        xlsx_bytes = await get_doc_bytes(doc)
+        # تبدیل اکسل به زیپ حاوی VCF
+        zip_bytes = converter.convert_excel_to_vcf(xlsx_bytes)
 
-        # 4. فراخوانی موتور تبدیل
-        vcf_string = converter.convert_excel_to_vcf(file_content)
-        
-        # 5. آماده‌سازی فایل VCF برای ارسال
-        vcf_bytes = vcf_string.encode('utf-8')
-        output_file = ("contacts.vcf", vcf_bytes)
-        
-        # 6. ارسال فایل نهایی
+        # نام فایل خروجی بر اساس نام اکسل
+        base_name = Path(document_filename(doc) or "contacts").stem
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{base_name}.zip")
+        with open(tmp_path, "wb") as tmp_file:
+            tmp_file.write(zip_bytes)
+
         await message.reply_document(
-            document=output_file,
-            caption="✅ فایل VCF شما آماده است. می‌توانید آن را در گوشی خود باز کرده و مخاطبین را ذخیره کنید."
+            document=tmp_path,
+            caption="✅ فایل ZIP آماده است."
         )
 
     except ValueError as e:
-        # مدیریت خطاهای قابل پیش‌بینی (مانند فایل خالی یا فرمت نادرست)
-        await message.reply(f"❌ خطا در پردازش فایل: {e}")
-        logger.warning(f"Processing error for user {message.author.id}: {e}")
+        await message.reply(f"❌ {e}")
+        logger.warning("Validation error: %s", e)
     except Exception as e:
-        # مدیریت خطاهای غیرمنتظره
-        await message.reply("❌ یک خطای پیش‌بینی نشده رخ داد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
-        logger.error(f"Unexpected error for user {message.author.id}: {e}", exc_info=True)
+        await message.reply("❌ خطای غیرمنتظره. لطفاً دوباره تلاش کنید.")
+        logger.exception("Unexpected error: %s", e)
         if ADMIN_ID:
-            await bot.send_message(ADMIN_ID, f"เกิดข้อผิดพลาดที่ไม่คาดคิด: {e}")
+            await bot.send_message(ADMIN_ID, f"Unexpected error: {e}")
     finally:
-        # حذف پیام "در حال پردازش"
-        await processing_msg.delete()
+        # پاک‌سازی فایل موقت
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                logger.warning("Failed to remove temp file %s", tmp_path)
+        await processing.delete()
 
 
 if __name__ == "__main__":
